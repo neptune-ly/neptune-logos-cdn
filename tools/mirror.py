@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 ORIGIN = os.environ.get("ORIGIN", "https://logos.neptune.ly/v1/")
 OUT = os.path.join(os.path.dirname(__file__), "..", "docs", "v1")
@@ -42,21 +43,33 @@ def main() -> None:
         sys.exit(f"refusing: merchants {before} -> {len(merchants)}; run with force to accept")
 
     os.makedirs(os.path.join(OUT, "logo"), exist_ok=True)
+    wanted = []
     for m in merchants:
         h = m.get("logo", "")
         if not re.fullmatch(r"[a-f0-9]{16}", h):
             sys.exit(f"refusing: bad logo id for {m.get('id')}")
         for size in doc.get("logoSizes", [96, 256]):
-            path = os.path.join(OUT, "logo", f"{h}-{size}.webp")
-            if os.path.exists(path):
-                continue
-            data = get(f"{ORIGIN}logo/{h}-{size}.webp")
-            if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
-                sys.exit(f"refusing: {h}-{size} is not WebP")
-            if size == 256 and hashlib.sha256(data).hexdigest()[:16] != h:
-                sys.exit(f"refusing: {h}-256 does not match its hash")
-            with open(path, "wb") as f:
-                f.write(data)
+            if not os.path.exists(os.path.join(OUT, "logo", f"{h}-{size}.webp")):
+                wanted.append((h, size))
+
+    def fetch(item):
+        h, size = item
+        data = get(f"{ORIGIN}logo/{h}-{size}.webp")
+        if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            raise ValueError(f"{h}-{size} is not WebP")
+        if size == 256 and hashlib.sha256(data).hexdigest()[:16] != h:
+            raise ValueError(f"{h}-256 does not match its hash")
+        return item, data
+
+    # A thousand new logos one by one outlast the job's time limit (18 Nov: 588 merchants).
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        try:
+            for (h, size), data in pool.map(fetch, wanted):
+                with open(os.path.join(OUT, "logo", f"{h}-{size}.webp"), "wb") as f:
+                    f.write(data)
+        except ValueError as e:
+            sys.exit(f"refusing: {e}")
+    print(f"fetched {len(wanted)} logo files")
 
     # The index goes last, so it never names a logo that is not already here.
     with open(index_path + ".tmp", "wb") as f:
